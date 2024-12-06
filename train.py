@@ -148,17 +148,121 @@ def main(args):
         accelerator.native_amp = False    
     if args.seed is not None:
         set_seed(args.seed + accelerator.process_index)
-    
-    # Create model:
+
+    # Create model:    
     assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.resolution // 8
-
+    
     if args.enc_type != 'None':
         encoders, encoder_types, architectures = load_encoders(args.enc_type, device)
     else:
         encoders, encoder_types, architectures = [None], [None], [None]
     z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
+
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
+
+    # ==================== Phase 1: Train the L2R Model ====================
+    
+    # Initialize L2R model
+    l2r_model = SiT_models['SiT-L2R'](
+        input_size=latent_size,
+        num_classes=args.num_classes,
+        use_cfg=False,  # No classifier-free guidance during L2R training
+        z_dims=z_dims,
+        encoder_depth=args.encoder_depth,
+        **block_kwargs
+    ).to(device)
+    
+    # Define optimizer for L2R
+    l2r_optimizer = torch.optim.AdamW(
+        l2r_model.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+    
+    # Setup data loader for L2R
+    l2r_train_dataset = CustomDataset(args.data_dir)
+    l2r_local_batch_size = int(args.batch_size // accelerator.num_processes)
+    l2r_train_dataloader = DataLoader(
+        l2r_train_dataset,
+        batch_size=l2r_local_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    if accelerator.is_main_process:
+        logger.info(f"L2R Dataset contains {len(l2r_train_dataset):,} images ({args.data_dir})")
+    
+    # Prepare L2R model with accelerator
+    l2r_model, l2r_optimizer, l2r_train_dataloader = accelerator.prepare(
+        l2r_model, l2r_optimizer, l2r_train_dataloader
+    )
+    
+    if accelerator.is_main_process:
+        logger.info(f"L2R Model Parameters: {sum(p.numel() for p in l2r_model.parameters()):,}")
+    
+    # Train L2R model
+    l2r_progress_bar = tqdm(
+        range(0, args.l2r_epochs),
+        desc="L2R Epochs",
+        disable=not accelerator.is_local_main_process,
+    )
+    for epoch in l2r_progress_bar:
+        l2r_model.train()
+        epoch_loss = 0
+        for raw_image, x, y in l2r_train_dataloader:
+            raw_image = raw_image.to(device)
+            x = x.squeeze(dim=1).to(device)
+            y = y.to(device)
+            
+            with torch.no_grad():
+                # Encode images to get representations
+                zs = []
+                for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
+                    if encoder is not None:
+                        raw_image_ = preprocess_raw_image(raw_image, encoder_type)
+                        z = encoder.forward_features(raw_image_)
+                        if 'mocov3' in encoder_type:
+                            z = z[:, 1:]
+                        if 'dinov2' in encoder_type:
+                            z = z['x_norm_patchtokens']
+                        zs.append(z)
+                # Concatenate all representations if multiple encoders
+                target_representations = torch.cat(zs, dim=1) if len(zs) > 1 else zs[0]
+            
+            # Forward pass through L2R model
+            l2r_pred, _ = l2r_model(x, torch.zeros(x.size(0), device=device), y, return_logvar=False)
+            
+            # Compute MSE loss between L2R predictions and target representations
+            loss = F.mse_loss(l2r_pred, target_representations)
+            
+            # Backpropagation
+            accelerator.backward(loss)
+            l2r_optimizer.step()
+            l2r_optimizer.zero_grad(set_to_none=True)
+            
+            epoch_loss += loss.item()
+        
+        avg_epoch_loss = epoch_loss / len(l2r_train_dataloader)
+        if accelerator.is_main_process:
+            logger.info(f"L2R Epoch {epoch + 1}/{args.l2r_epochs}, Loss: {avg_epoch_loss:.6f}")
+        l2r_progress_bar.set_postfix(loss=avg_epoch_loss)
+    
+    # Save L2R model weights
+    if accelerator.is_main_process:
+        torch.save(
+            l2r_model.state_dict(),
+            os.path.join(checkpoint_dir, "l2r_model.pt")
+        )
+        logger.info("Saved L2R model weights.")    
+
+    # ==================== Phase 2: Initialize and Train SiT Model ====================    
+
+    # Initialize SiT model
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
@@ -166,11 +270,19 @@ def main(args):
         z_dims = z_dims,
         encoder_depth=args.encoder_depth,
         **block_kwargs
-    )
+    ).to(device)
 
-    model = model.to(device)
+    # Load L2R weights into SiT (only the first eight layers)
+    l2r_state_dict = torch.load(os.path.join(checkpoint_dir, "l2r_model.pt"), map_location=device)
+    sit_state_dict = model.state_dict()
+    
+    # Transfer weights from L2R to SiT for the first eight layers
+    for name, param in l2r_state_dict.items():
+        if name in sit_state_dict:
+            sit_state_dict[name] = param
+    model.load_state_dict(sit_state_dict)
+
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
     requires_grad(ema, False)
     
     latents_scale = torch.tensor(
@@ -288,6 +400,7 @@ def main(args):
                 labels = torch.where(drop_ids, args.num_classes, y)
             else:
                 labels = y
+
             with torch.no_grad():
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
                 zs = []
@@ -299,14 +412,28 @@ def main(args):
                         if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
                         zs.append(z)
 
+                    target_representations = torch.cat(zs, dim=1) if len(zs) > 1 else zs[0]    
+
+            # Get L2R representations
+            with torch.no_grad():
+                l2r_representation, _ = l2r_model(x, torch.zeros(x.size(0), device=device), labels, return_logvar=False)
+            
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
                 loss, proj_loss = loss_fn(model, x, model_kwargs, zs=zs)
                 loss_mean = loss.mean()
                 proj_loss_mean = proj_loss.mean()
-                loss = loss_mean + proj_loss_mean * args.proj_coeff
-                    
-                ## optimization
+                
+                # Get SiT representations
+                sit_representation, _ = model(x, torch.zeros(x.size(0), device=device), labels)
+                
+                # Compute Alignment Loss (MSE between SiT and L2R representations)
+                alignment_loss = F.mse_loss(sit_representation, l2r_representation)
+                
+                # Total Loss: SiT losses + Alignment Loss
+                loss = loss_mean + proj_loss_mean * args.proj_coeff + alignment_loss * args.alignment_coeff
+                
+                # Backpropagation
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
@@ -315,12 +442,13 @@ def main(args):
                 optimizer.zero_grad(set_to_none=True)
 
                 if accelerator.sync_gradients:
-                    update_ema(ema, model) # change ema function
+                    update_ema(ema, model, decay=0.9999)        
             
             ### enter
             if accelerator.sync_gradients:
                 progress_bar.update(1)
-                global_step += 1                
+                global_step += 1 
+
             if global_step % args.checkpointing_steps == 0 and global_step > 0:
                 if accelerator.is_main_process:
                     checkpoint = {
@@ -359,8 +487,11 @@ def main(args):
                 logging.info("Generating EMA samples done.")
 
             logs = {
-                "loss": accelerator.gather(loss_mean).mean().detach().item(), 
-                "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
+                # "loss": accelerator.gather(loss_mean).mean().detach().item(), 
+                # "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
+                "loss": accelerator.gather(denoising_loss).mean().detach().item(), 
+                "proj_loss": accelerator.gather(proj_loss).mean().detach().item(),
+                "alignment_loss": accelerator.gather(alignment_loss).mean().detach().item(),
                 "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
             }
             progress_bar.set_postfix(**logs)
@@ -432,6 +563,9 @@ def parse_args(input_args=None):
     parser.add_argument("--proj-coeff", type=float, default=0.5)
     parser.add_argument("--weighting", default="uniform", type=str, help="Max gradient norm.")
     parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False)
+
+    parser.add_argument("--l2r-epochs", type=int, default=10000, help="Number of epochs to train the L2R model.")
+    parser.add_argument("--alignment-coeff", type=float, default=1.0, help="Coefficient for the alignment loss.")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
